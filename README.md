@@ -318,7 +318,7 @@ The system can automatically write evaluation results to Google Spreadsheets for
 
 1. **Create or Open Google Spreadsheet**:
    - Create a new Google Spreadsheet or open an existing one
-   - Copy the structure from the [Example spreadsheet]() (removed for deanonimization)
+   - Copy the structure from the Example spreadsheet (removed for anonimization)
    - Share the spreadsheet for editing.
 
 For privacy-sensitive evaluations you may share "Editor" permissions only with your service account email (found in the JSON file).
@@ -336,7 +336,7 @@ For privacy-sensitive evaluations you may share "Editor" permissions only with y
    ```bash
    # Add to your .env file:
    RAG_WRITE_SPREADSHEET=true
-   SPREADSHEET_ID=1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms  # Example ID
+   SPREADSHEET_ID=
    SPREADSHEET_GID=Sheet1  # Sheet name or numeric GID
    ```
 
