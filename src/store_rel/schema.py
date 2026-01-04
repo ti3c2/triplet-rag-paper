@@ -278,7 +278,9 @@ async def get_or_create_item(
             # Race condition: another process created the item
             # Roll back and fetch the existing item
             await session.rollback()
-            item = await session.execute(select(model_class).filter_by(text_hash=text_hash))
+            item = await session.execute(
+                select(model_class).filter_by(text_hash=text_hash)
+            )
             item = item.scalars().first()
             if item is None:
                 # If still not found, re-raise the original error
@@ -287,10 +289,12 @@ async def get_or_create_item(
     return item, created_new
 
 
-async def get_prompt(session, prompt_name: str) -> Prompt:
+async def get_prompt(session, prompt_name: str, ignore_missing: bool = False) -> Prompt:
     prompt_db = await session.execute(select(Prompt).where(Prompt.name == prompt_name))
     prompts = prompt_db.scalars().all()
     if len(prompts) == 0 or prompts[0] is None:
+        if ignore_missing:
+            return None
         raise ValueError(f"Prompt {prompt_name} not found in the database.")
     prompt = sorted(prompts, key=lambda x: x.id)[-1]
     if len(prompts) > 1:

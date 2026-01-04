@@ -3,7 +3,7 @@ from typing import List, Literal, Optional, Tuple, Union
 
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config.settings import settings
@@ -162,11 +162,11 @@ class DatabaseKNNRetriever(KNNRetriever):
             # Load QUERY vectors with all needed data to avoid lazy loading
             if "query" in self.retrieval_sources:
                 prompt = settings.question_generation_default_prompt
-                prompt_db = await get_prompt(session, prompt.name)
-                prompt_id = prompt_db.id
+                prompt_db = await get_prompt(session, prompt.name, ignore_missing=True)
+                prompt_id = prompt_db.id if prompt_db else None
                 logger.info(f"Using prompt: id={prompt_id}, name={prompt.name}")
 
-                query_q = await session.execute(
+                query_q_sql = (
                     select(
                         QueryVector.vector,
                         Query.id.label("query_id"),
@@ -187,21 +187,31 @@ class DatabaseKNNRetriever(KNNRetriever):
                     .join(Query, QueryVector.parent_id == Query.id)
                     .join(Doc, Query.doc_id == Doc.id)
                     .join(Chunk, Query.chunk_id == Chunk.id)
-                    .join(Prompt, Query.prompt_id == Prompt.id)
+                    .outerjoin(Prompt, Query.prompt_id == Prompt.id)
                     .outerjoin(
                         Answer, Query.id == Answer.query_id
                     )  # Left join for answers
                     .where(
                         Doc.dataset == self.dataset,
                         QueryVector.emb_model == self.emb_model,
-                        Query.llm == self.model,
+                        or_(
+                            Query.llm.is_(None),
+                            Query.llm == self.model,
+                        ),
                         # # Only include generated queries which do not have hf_id
                         # Query.hf_id.is_(None),
                         Query.qa_type.in_(self.qa_type.split(",")),
-                        Query.prompt_id == prompt_id,
+                        or_(
+                            Query.prompt_id.is_(None),
+                            Query.prompt_id == prompt_id,
+                        ),
                         Query.origin.in_(self.retrieval_query_origins),
                     )
                 )
+                logger.info(
+                    f"Query SQL:\n{query_q_sql.compile(compile_kwargs={'literal_binds': True})}"
+                )
+                query_q = await session.execute(query_q_sql)
                 query_results = query_q.all()
 
                 for row in query_results:

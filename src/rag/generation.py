@@ -1,5 +1,5 @@
 import logging
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Literal, Optional
 
 import openai
 from pydantic import BaseModel, ConfigDict, Field
@@ -149,18 +149,39 @@ class LLMGenerator(BaseModel):
         triplets: Iterable[Triplet],
         k: Optional[int],
         n_contexts: int = settings.rag_n_triplet_contexts,
+        triplets_apply_formatting: bool = settings.rag_triplet_apply_formatting,
     ) -> str:
-        parts: list[str] = ["[Retrieved Contexts from Triplets]"]
-        for idx, t in enumerate(triplets, start=1):
-            ctxs = self._select_triplet_contexts(t, k, n_contexts)
-            # Contexts
-            for j, c in enumerate(ctxs, start=1):
-                parts.append(f"[Triplet {idx} - Context {j}]\n{c.text.strip()}")
-            # Reference QA
-            if t.ref_q:
-                parts.append(f"[Triplet {idx} - Reference Question]\n{t.ref_q.strip()}")
-            if t.ref_a:
-                parts.append(f"[Triplet {idx} - Reference Answer]\n{t.ref_a.strip()}")
+        if triplets_apply_formatting == "triplet":
+            parts: list[str] = ["[Retrieved Contexts from Triplets]"]
+            for idx, t in enumerate(triplets, start=1):
+                ctxs = self._select_triplet_contexts(t, k, n_contexts)
+                # Contexts
+                for j, c in enumerate(ctxs, start=1):
+                    parts.append(f"[Triplet {idx} - Context {j}]\n{c.text.strip()}")
+                # Reference QA
+                if t.ref_q:
+                    parts.append(
+                        f"[Triplet {idx} - Reference Question]\n{t.ref_q.strip()}"
+                    )
+                if t.ref_a:
+                    parts.append(
+                        f"[Triplet {idx} - Reference Answer]\n{t.ref_a.strip()}"
+                    )
+        elif triplets_apply_formatting == "chunk":
+            # Only chunks
+            parts: list[str] = ["[Retrieved Contexts]"]
+            counter = 1
+            for idx, t in enumerate(triplets, start=1):
+                ctxs = self._select_triplet_contexts(t, k, n_contexts)
+                for j, c in enumerate(ctxs, start=1):
+                    parts.append(f"[Context {counter}]\n{c.text.strip()}")
+                    counter += 1
+        elif triplets_apply_formatting == "qa":
+            # Only qa
+            parts: list[str] = ["[Retrieved Questions and Answers]"]
+            for idx, t in enumerate(triplets, start=1):
+                parts.append(f"[Question]\n{t.ref_q.strip()}")
+                parts.append(f"[Answer]\n{t.ref_a.strip()}")
         return "\n\n".join(parts)
 
     def _triplets_to_retrieval_items(
@@ -170,22 +191,44 @@ class LLMGenerator(BaseModel):
         n_contexts: int = settings.rag_n_triplet_contexts,
         dataset: Optional[str] = None,
         emb_model: Optional[str] = None,
+        triplets_apply_formatting: str = settings.rag_triplet_apply_formatting,
     ) -> List[RetrievalItem]:
         items: list[RetrievalItem] = []
-        for t in triplets:
-            for c in self._select_triplet_contexts(t, k, n_contexts):
+        if triplets_apply_formatting in ["chunk", "triplet"]:
+            for t in triplets:
+                for c in self._select_triplet_contexts(t, k, n_contexts):
+                    meta = ChunkMetadata(
+                        chunk_id=c.chunk_id,
+                        doc_id=c.doc_id,
+                        dataset=dataset or "",
+                        doc_title=c.doc_title,
+                        type="chunk",
+                        emb_model=emb_model,
+                    )
+                    items.append(
+                        RetrievalItem(
+                            score=float(c.score),
+                            text=c.text,
+                            metadata=meta,
+                        )
+                    )
+        elif triplets_apply_formatting == "qa":
+            for t in triplets:
+                q_text = t.ref_q.split(settings.qa_separator)[0].strip()
+                a_text = t.ref_a.strip()
                 meta = ChunkMetadata(
-                    chunk_id=c.chunk_id,
-                    doc_id=c.doc_id,
+                    chunk_id=None,
+                    doc_id=None,
                     dataset=dataset or "",
-                    doc_title=c.doc_title,
-                    type="chunk",
+                    type="query",
+                    query=q_text,
+                    qa_type="qa",
                     emb_model=emb_model,
                 )
                 items.append(
                     RetrievalItem(
-                        score=float(c.score),
-                        text=c.text,
+                        score=float(t.score),
+                        text=f"{q_text}{settings.qa_separator}{a_text}",
                         metadata=meta,
                     )
                 )
@@ -200,6 +243,7 @@ class LLMGenerator(BaseModel):
         dataset: str = settings.rag_dataset,
         emb_model: str = settings.openai_embedding_model,
         generate_answer: bool = settings.rag_triplet_generate_answer,
+        triplets_apply_formatting: str = settings.rag_triplet_apply_formatting,
     ) -> RagResponse:
         """Generate an answer using multiple triplets (multiple ref_q/ref_a and contexts).
 
@@ -207,7 +251,12 @@ class LLMGenerator(BaseModel):
         Also constructs a RetrievalResult from the combined contexts for downstream logging/metrics.
         """
         try:
-            multi_context = self.format_triplet_blocks(triplets, k, n_contexts)
+            multi_context = self.format_triplet_blocks(
+                triplets,
+                k,
+                n_contexts,
+                triplets_apply_formatting,
+            )
             prompt = self.create_prompt(question=question, context=multi_context)
 
             if generate_answer:
@@ -243,4 +292,86 @@ class LLMGenerator(BaseModel):
             )
         except Exception as e:
             logger.error(f"Error generating response (triplets): {str(e)}")
+            raise
+
+    async def generate_triplets_with_chunks(
+        self,
+        question: str,
+        triplets: List[Triplet],
+        chunk_retrieval_result: RetrievalResult,
+        k: int,
+        n_contexts: int = settings.rag_n_triplet_contexts,
+        dataset: str = settings.rag_dataset,
+        emb_model: str = settings.openai_embedding_model,
+        generate_answer: bool = settings.rag_generate_answer,
+        return_all_items: bool = False,
+        respect_total_contexts: bool = False,
+    ) -> RagResponse:
+        """Generate an answer using triplets first, then chunk-based contexts.
+
+        - Triplet contexts are formatted using ``format_triplet_blocks``.
+        - Retrieved chunks are formatted using ``format_context``.
+        - The final ``RetrievalResult`` contains triplet-derived items followed by chunk items.
+        """
+        try:
+            # Build retrieval items from triplets (limited by n_contexts and k where applicable)
+            triplet_items = self._triplets_to_retrieval_items(
+                triplets,
+                k,
+                n_contexts=n_contexts,
+                dataset=dataset,
+                emb_model=emb_model,
+            )
+
+            # Fill the remaining budget with chunk items so that total contexts ~= k
+            if respect_total_contexts:
+                remaining_slots = (
+                    max(0, k - len(triplet_items)) if k is not None else None
+                )
+                if remaining_slots is None or remaining_slots == 0:
+                    chunk_items: List[RetrievalItem] = []
+                else:
+                    chunk_items = chunk_retrieval_result.items[:remaining_slots]
+
+            chunk_items = chunk_retrieval_result.items
+            all_items = triplet_items + chunk_items
+
+            # Build context text: triplets first, then chunk contexts
+            parts: list[str] = []
+            if triplets:
+                parts.append(self.format_triplet_blocks(triplets, k, n_contexts))
+            if chunk_items:
+                parts.append(self.format_context(RetrievalResult(items=chunk_items)))
+            context = "\n\n".join(parts) if parts else ""
+
+            prompt = self.create_prompt(question=question, context=context)
+
+            if generate_answer:
+                response = await create_chat_completion(
+                    self.client,
+                    model=self.model,
+                    messages=[
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                )
+                answer = response.choices[0].message.content or ""
+            else:
+                answer = ""
+                logger.debug(f"Skipping answer generation for question: {question}")
+
+            retrieval_result = RetrievalResult(
+                items=all_items if return_all_items else chunk_items
+            )
+            return RagResponse(
+                answer=answer,
+                query=question,
+                model=self.model,
+                retrieval_scores=[it.score for it in all_items],
+                n_context=len(retrieval_result.items),
+                retrieval_result=retrieval_result,
+            )
+        except Exception as e:
+            logger.error("Error generating response (triplets_with_chunks): %s", str(e))
             raise

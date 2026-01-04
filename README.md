@@ -25,6 +25,7 @@ data/
 │   └───└── metrics_20250804_220605.csv # Metrics
 ├── sql/store.db         # SQLite database folder
 src/
+├── cli.py               # CLI entrypoint exposing trcli (ETL, embed, rag, eval, db)
 ├── config/
 │   ├── settings.py      # Project configuration and settings
 │   ├── prompts.py       # Prompt templates for basic/complex modes
@@ -32,8 +33,11 @@ src/
 │   └── utils.py         # Util functions used in different parts of code
 ├── etl/
 │   └── etl_hf.py        # Data processing and embedding generation
+├── eval/
+│   ├── evaluate.py          # Standard evaluation (retrieval + generation)
+│   ├── ragas_evaluation.py  # RAGAS post-evaluation metrics
+│   └── triplet_evaluate.py  # Triplet and two-stage triplet evaluations
 ├── rag/
-│   ├── evaluate.py      # Pipeline for evaluation
 │   ├── generation.py    # LLM response generation
 │   ├── models.py        # Pydantic data models
 │   ├── pipeline.py      # Main RAG pipeline implementation
@@ -139,6 +143,7 @@ RAG_MAX_TRIPLET_CONTEXTS=-1              # Max triplet contexts to inject (-1 fo
 RAG_N_TRIPLET_CONTEXTS=5                 # Number of contexts to use per triplet
 RAG_TRIPLET_GENERATE_ANSWER=true         # Generate answers when using triplets
 RAG_PERSIST_TRIPLETS=false               # Persist triplets to DB during evaluation
+RAG_READONLY_EVAL=false                  # Skip DB writes when true
 RAG_TRIPLET_JSON_PATH=                   # Path to triplets JSON file (optional)
 RAG_RETRIEVAL_QUERY_ORIGINS=["dataset"]  # Query origins for retrieval: dataset, quote, eval, two-stage
 EVAL_WHITELIST_ORIGINS=["eval"]          # Origins allowed for evaluation queries
@@ -988,8 +993,10 @@ trcli eval run [OPTIONS]
 #   --deduplication_factor: Factor for deduplication (default: 1)
 #   --max_queries: Maximum number of queries to evaluate (-1 for all)
 #   --generate_answer: Whether to generate answers (default: true)
+#   --triplet_json_path: Inject triplet contexts from JSON (enables triplet formatting)
 #   --write_spreadsheet: Write results to Google Spreadsheet (default: from config)
 #   --spreadsheet_sheet_name: Name of the sheet to write to (default: from config)
+#   --max_queries_ragas: Limit queries when auto-running ragas (default: config)
 #   --output_json: Output results in JSON format (default: false)
 #   --silent: Run silently without output (default: true)
 #   --run_ragas: Whether to automatically run RAGAS evaluation after standard evaluation (default: from config)
@@ -1001,7 +1008,14 @@ trcli eval run --dataset=multihoprag --output_json=true
 trcli eval run --generate_answer=false --max_queries=50
 trcli eval run --write_spreadsheet=true --spreadsheet_sheet_name="Results"
 trcli eval run --run_ragas=true  # Run with RAGAS evaluation
+trcli eval run --triplet_json_path=data/eval/<exp>/triplets.json  # inject triplet contexts during standard eval
 ```
+
+**What it does (regular eval):**
+- Selects evaluation queries by `RAG_RETRIEVAL_QUERY_ORIGINS` and `EVAL_WHITELIST_ORIGINS` (eval-origin whitelisted when present; prompt-less queries always allowed).
+- Runs retrieval over chunk/query vectors; optionally injects triplet contexts when `--triplet_json_path` is passed or `RAG_USE_TRIPLET_CONTEXTS=true`.
+- Persists triplets (`QueryTriplet` + `<ts>_triplets.json`) only when `RAG_PERSIST_TRIPLETS=true` **and** `RAG_READONLY_EVAL=false`.
+- Generates answers when `--generate_answer` is true; outputs live under `data/eval/<timestamp>_<dataset>_*` as `.json`, `.txt`, and `*_metrics.csv`.
 
 ##### `eval run_ragas`
 Run advanced RAGAS evaluation on existing evaluation results using LLM-based metrics.
@@ -1064,7 +1078,7 @@ trcli eval run_triplet [OPTIONS]
 #   --retrieval_sources: Sources for retrieval (default: ["chunk", "query"])
 #   --deduplication_factor: Factor for deduplication (default: 1)
 #   --max_queries: Maximum number of queries to evaluate (-1 for all)
-#   --generate_answer: Whether to generate answers (default: true)
+#   --generate_answer: Generate answers during retrieval stage (triplet stage always generates)
 #   --triplet_json_path: Path to triplets JSON file (optional, uses DB if not set)
 #   --output_json: Output in JSON format (default: false)
 #   --silent: Run silently without output (default: true)
@@ -1074,6 +1088,11 @@ trcli eval run_triplet --dataset=squad --max_queries=100
 trcli eval run_triplet --triplet_json_path=data/eval/experiment/triplets.json
 trcli eval run_triplet --ks=[1,5,10] --generate_answer=true
 ```
+
+**What it does (triplet eval):**
+- Builds the retrieval index from eval-origin queries, then injects triplet contexts (DB-backed or `--triplet_json_path`) as the retrieval output.
+- Uses dataset-origin questions as evaluation inputs; answers for triplet contexts are generated (retrieval-stage answer generation is gated by `--generate_answer`).
+- Writes the same artifact trio as regular eval; retrieval results and triplet contexts are stored per-query in the evaluation set.
 
 ##### `eval run_two_stage_triplet`
 Run two-stage (query+chunk) triplet-augmented evaluation.

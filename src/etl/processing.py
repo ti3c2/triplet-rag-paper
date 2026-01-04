@@ -155,7 +155,9 @@ async def generate_questions_for_doc(
     qa_type: Literal["qa", "qc"] = settings.question_generation_mode,
     sequential: str = settings.qa_sequential_generation,
     max_concurrency: int = settings.openai_chat_completion_max_concurrency,
-    origin: Literal["dataset", "quote", "eval"] = settings.rag_retrieval_query_origins[0],
+    origin: Literal["dataset", "quote", "eval"] = settings.rag_retrieval_query_origins[
+        0
+    ],
 ) -> list[Query | Answer]:
     """Generate questions for a document using LLM with structured output."""
     db_items = []
@@ -286,7 +288,9 @@ async def generate_questions_for_docs(
     max_docs: int = -1,
     model: str = settings.question_generation_model,
     prompt_name: Optional[str] = settings.question_generation_prompt_name,
-    origin: Literal["dataset", "quote", "eval"] = settings.rag_retrieval_query_origins[0],
+    origin: Literal["dataset", "quote", "eval"] = settings.rag_retrieval_query_origins[
+        0
+    ],
 ):
     logger.info(f"Settings:\n{settings.model_dump_json(indent=2)}")
     if not await settings.ping_model(settings.question_generation_model):
@@ -399,7 +403,9 @@ async def generate_questions_for_docs(
         max_pool_connections = settings.sql_pool_size + settings.sql_max_overflow
         batch_size = docs_commited if docs_commited > 0 else total_docs
         # Use smaller of: requested batch size or available connections (with safety margin)
-        batch_size = min(batch_size, max_pool_connections - 5)  # Reserve 5 for other queries
+        batch_size = min(
+            batch_size, max_pool_connections - 5
+        )  # Reserve 5 for other queries
 
         logger.info(
             f"Batch size: {batch_size} (limited by pool size: {max_pool_connections})"
@@ -409,7 +415,9 @@ async def generate_questions_for_docs(
             batch_end = min(batch_start + batch_size, total_docs)
             batch = docs_to_process[batch_start:batch_end]
 
-            logger.info(f"Processing batch: docs {batch_start+1}-{batch_end}/{total_docs}")
+            logger.info(
+                f"Processing batch: docs {batch_start+1}-{batch_end}/{total_docs}"
+            )
 
             # Create tasks for concurrent processing, each with its own session
             tasks = [
@@ -426,7 +434,9 @@ async def generate_questions_for_docs(
 
             # Execute batch concurrently with semaphore limiting
             await execute_with_semaphore(tasks, max_concurrency)
-            logger.info(f"Completed batch: docs {batch_start+1}-{batch_end}/{total_docs}")
+            logger.info(
+                f"Completed batch: docs {batch_start+1}-{batch_end}/{total_docs}"
+            )
 
 
 async def embed_db_items(
@@ -439,6 +449,7 @@ async def embed_db_items(
     batch_size: int = settings.openai_embedding_batch_size,
     max_items: int = -1,
     qa_type: str = settings.question_generation_mode,
+    ignore_missing_prompt: bool = True,
 ) -> Union[List[QueryVector], List[ChunkVector]]:
     logger.info(f"Settings:\n{settings.model_dump_json(indent=2)}")
     if not await settings.ping_model(emb_model):
@@ -450,8 +461,12 @@ async def embed_db_items(
     prompt = settings.question_generation_default_prompt
     logger.info(f"Using prompt: {prompt.name}\n{prompt.text}")
     async with get_db() as session:
-        prompt_db = await get_prompt(session, prompt.name)
-        prompt_id = prompt_db.id
+        prompt_db = await get_prompt(session, prompt.name, ignore_missing_prompt)
+        if prompt_db is None:
+            logger.warning(f"Prompt {prompt.name} not found in the database")
+            prompt_id = -1
+        else:
+            prompt_id = prompt_db.id
 
         # Prepare items for processing
         items_to_process = []

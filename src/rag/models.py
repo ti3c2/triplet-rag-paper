@@ -460,4 +460,3 @@ class Triplet(BaseModel):
 
 class Triplets(BaseModel):
     triplets: List[Triplet]
-

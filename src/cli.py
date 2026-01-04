@@ -21,7 +21,10 @@ from .etl import (
 )
 from .eval.evaluate import recalculate_metrics, run_evaluation
 from .eval.ragas_evaluation import run_ragas_evaluation
-from .eval.triplet_evaluate import run_triplet_evaluation
+from .eval.triplet_evaluate import (
+    run_triplet_evaluation,
+    run_two_stage_triplet_evaluation,
+)
 from .rag.models import EvaluationResult
 from .rag.pipeline import RAGPipeline
 from .store_rel.entry import get_db
@@ -544,6 +547,59 @@ class EvaluationCommands:
             deduplication_factor=deduplication_factor,
             max_queries=max_queries_param,
             generate_answer_retrieval=generate_answer,
+        )
+
+        if silent:
+            return
+        if output_json:
+            print(json.dumps(result.model_dump(), indent=2, default=str))
+        else:
+            self._print_evaluation_results(result, dataset)
+
+    async def run_two_stage_triplet(
+        self,
+        dataset: str = settings.rag_dataset,
+        batch_size: int = settings.rag_batch_size,
+        ks: List[int] = settings.rag_retrieval_ks,
+        rag_llm: str = settings.rag_generation_model,
+        qgen_llm: str = settings.question_generation_model,
+        emb_model: str = settings.openai_embedding_model,
+        deduplication_factor: int = settings.rag_deduplication_factor,
+        max_queries: int = settings.eval_max_queries,
+        generate_answer: bool = settings.rag_generate_answer,
+        k_query: Optional[int] = None,
+        k_chunk: Optional[int] = None,
+        triplet_json_path: Optional[str] = None,
+        output_json: bool = False,
+        silent: bool = True,
+    ):
+        """Run two-stage (query+chunk) triplet-augmented evaluation.
+
+        Stage 1 retrieves query-origin='two-stage' items to locate triplets; stage 2
+        retrieves chunk-based contexts. Both stages' contexts are concatenated and
+        passed to the generator.
+        """
+        logger.info(f"Starting two-stage triplet evaluation on dataset: {dataset}")
+
+        # Optionally override triplet JSON source for this run
+        if triplet_json_path:
+            settings.rag_triplet_json_path = triplet_json_path
+
+        max_queries_param = None if max_queries == -1 else max_queries
+
+        result = await run_two_stage_triplet_evaluation(
+            dataset=dataset,
+            batch_size=batch_size,
+            ks=ks,
+            rag_llm=rag_llm,
+            qgen_llm=qgen_llm,
+            emb_model=emb_model,
+            rag_qa_type=settings.question_generation_mode,
+            deduplication_factor=deduplication_factor,
+            max_queries=max_queries_param,
+            generate_answer=generate_answer,
+            k_query=k_query,
+            k_chunk=k_chunk,
         )
 
         if silent:
@@ -1175,19 +1231,19 @@ class RAGCLITool:
 
     Examples:
         # Load SQuAD dataset
-        trcli etl fill_db [squad,natural-questions,multihop] --n_rows=1000
+        quote-cli etl fill_db [squad,natural-questions,multihop] --n_rows=1000
 
         # Generate questions for documents
-        trcli questions generate --dataset=squad --max_docs=100
+        quote-cli questions generate --dataset=squad --max_docs=100
 
         # Convert q-type queries to qa-type (question+answer)
-        trcli questions convert_q_to_qa --dataset=squad --llm=gpt-4o-mini
+        quote-cli questions convert_q_to_qa --dataset=squad --llm=gpt-4o-mini
 
         # Load queries from CSV files
-        trcli questions load_csv queries.csv --dataset=squad --prompt_name=eval_queries
-        trcli questions load_csv csv_directory/ --dataset=squad --n_rows=1000 --prompt_name=eval_queries
-        trcli questions load_csv [file1.csv,file2.csv,dir1/] --dataset=my_dataset --prompt_name=eval_queries
-        trcli questions load_csv queries.csv --dataset=my_dataset --prompt_name=eval_queries
+        quote-cli questions load_csv queries.csv --dataset=squad --prompt_name=eval_queries
+        quote-cli questions load_csv csv_directory/ --dataset=squad --n_rows=1000 --prompt_name=eval_queries
+        quote-cli questions load_csv [file1.csv,file2.csv,dir1/] --dataset=my_dataset --prompt_name=eval_queries
+        quote-cli questions load_csv queries.csv --dataset=my_dataset --prompt_name=eval_queries
 
         # Load queries from CSV files
         rag-cli questions load_csv queries.csv --dataset=earthquake_dataset
@@ -1196,36 +1252,36 @@ class RAGCLITool:
         rag-cli questions load_csv queries.csv --dataset=my_dataset --prompt_name=eval_queries
 
         # Generate embeddings for chunks
-        trcli embed chunks --dataset=squad
+        quote-cli embed chunks --dataset=squad
 
         # Query the RAG system
-        trcli rag query "What is the capital of France?"
+        quote-cli rag query "What is the capital of France?"
 
         # Run evaluation on dataset
-        trcli eval run --dataset=squad --max_queries=100
+        quote-cli eval run --dataset=squad --max_queries=100
 
         # Run ragas evaluation on existing results
-        trcli eval run_ragas data/eval/experiment/20250101_120000.json
+        quote-cli eval run_ragas data/eval/experiment/20250101_120000.json
 
         # Run ragas evaluation with specific metrics
-        trcli eval run_ragas data/eval/experiment/20250101_120000.json --metrics_to_use=[context_precision,faithfulness]
+        quote-cli eval run_ragas data/eval/experiment/20250101_120000.json --metrics_to_use=[context_precision,faithfulness]
 
         # Check database statistics
-        trcli db stats
+        quote-cli db stats
 
         # Export data from SQLite to PostgreSQL
-        trcli db export_to_postgres --recreate_tables=True
+        quote-cli db export_to_postgres --recreate_tables=True
 
         # Export data with custom database URLs
-        trcli db export_to_postgres --source_database_url="sqlite:///custom.db" --target_database_url="postgresql+asyncpg://user:pass@host:port/db"
+        quote-cli db export_to_postgres --source_database_url="sqlite:///custom.db" --target_database_url="postgresql+asyncpg://user:pass@host:port/db"
 
         # Delete queries by model
-        trcli db delete_queries_by_llm --llm=Qwen/Qwen2.5-7B-Instruct
+        quote-cli db delete_queries_by_llm --llm=Qwen/Qwen2.5-7B-Instruct
 
         # Get help for specific commands
-        trcli etl --help
-        trcli rag --help
-        trcli eval --help
+        quote-cli etl --help
+        quote-cli rag --help
+        quote-cli eval --help
     """
 
     def __init__(self):

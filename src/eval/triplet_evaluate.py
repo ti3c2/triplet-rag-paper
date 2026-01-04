@@ -19,7 +19,7 @@ from ..rag.models import (
     RagResponse,
     RetrievalResult,
 )
-from ..rag.pipeline import RAGPipeline
+from ..rag.pipeline import RAGPipeline, TwoStageRAGPipeline
 from ..rag.triplet_store import (
     build_result_from_triplet,
     fetch_triplets_by_eval_query_ids,
@@ -59,7 +59,7 @@ async def run_triplet_evaluation(
     generate_answer_triplets: bool = True,
     write_json: bool = settings.rag_write_json,
     write_txt: bool = settings.rag_write_txt,
-    write_spreadsheet: bool = False,  # keep spreadsheet disabled by default for triplet eval
+    write_spreadsheet: bool = settings.rag_write_spreadsheet,
     spreadsheet_sheet_name: Optional[str] = None,
 ) -> EvaluationResult:
     """Evaluate using dataset-origin questions and an index built from eval-origin queries.
@@ -102,6 +102,9 @@ async def run_triplet_evaluation(
             )
             .limit(max_queries)
             .order_by(Query.id)
+        )
+        logger.info(
+            f"Query SQL:\n{query_sql.compile(compile_kwargs={'literal_binds': True})}"
         )
         results = await session.execute(query_sql)
         rows = results.all()
@@ -260,7 +263,7 @@ async def run_triplet_evaluation(
                 # Attempt triplet match by overlapping chunk ids
                 # Prefer deterministic eval-query match; fallback to chunk-overlap
                 matched_triplets = find_triplets_for_retrieval_by_eval_query(
-                    triplet_eval_index, retres
+                    triplet_eval_index, retres, allowed_origins=["eval"]
                 )
 
                 # For each k, prepare response
@@ -334,6 +337,7 @@ async def run_triplet_evaluation(
 
     if write_spreadsheet:
         from ..config.spreadsheets import write_evaluation_to_spreadsheet
+
         try:
             retrieval_sources_str = (
                 "+".join(retrieval_sources)
@@ -363,5 +367,332 @@ async def run_triplet_evaluation(
     )
     df_metrics.to_csv(dirpath / f"{datetime_str}_metrics.csv", index=False)
     logger.info(f"Results saved to {dirpath.relative_to(settings.path_root)}")
+
+    return evaluation_result
+
+
+async def run_two_stage_triplet_evaluation(
+    dataset: str = settings.rag_dataset,
+    batch_size: int = 10,
+    ks: List[int] = settings.rag_retrieval_ks,
+    rag_llm: str = settings.rag_generation_model,
+    qgen_llm: str = settings.question_generation_model,
+    emb_model: str = settings.openai_embedding_model,
+    rag_qa_type: str = settings.question_generation_mode,
+    deduplication_factor: int = settings.rag_deduplication_factor,
+    max_queries: Optional[int] = settings.rag_max_rows,
+    generate_answer: bool = True,
+    write_json: bool = settings.rag_write_json,
+    write_txt: bool = settings.rag_write_txt,
+    write_spreadsheet: bool = settings.rag_write_spreadsheet,
+    spreadsheet_sheet_name: Optional[str] = None,
+    k_query: Optional[int] = None,
+    k_chunk: Optional[int] = None,
+) -> EvaluationResult:
+    """Evaluate using a two-stage retrieval pipeline (query -> triplets, chunks -> docs).
+
+    Stage 1: retrieve over query vectors with origin \"two-stage\" to locate associated triplets.
+    Stage 2: retrieve over chunk vectors for the same questions.
+    The resulting contexts from both stages are concatenated and passed to the standard generator.
+    """
+    logger.info(
+        f"Settings (two-stage triplet eval):\n{settings.model_dump_json(indent=2)}"
+    )
+    logger.info(
+        f"Preparing dataset-origin questions for two-stage triplet evaluation on {dataset}"
+    )
+    datetime_str = dt.now().strftime("%Y%m%d_%H%M%S")
+
+    # Resolve k per stage (default to max(ks) if not provided)
+    k_query = k_query or max(ks)
+    k_chunk = k_chunk or max(ks)
+
+    async with get_db() as session:
+        # Fetch dataset-origin queries and their embeddings (same as run_triplet_evaluation)
+        query_sql = (
+            select(
+                Query.id,
+                Query.text,
+                Query.text_hash,
+                Query.chunk_id,
+                Query.doc_id,
+                QueryVector.vector,
+                Query.origin,
+                Doc.meta.label("doc_meta"),
+                func.coalesce(Doc.title, "").label("doc_title"),
+            )
+            .join(QueryVector, Query.id == QueryVector.parent_id)
+            .join(Chunk, Query.chunk_id == Chunk.id)
+            .join(Doc, Chunk.doc_id == Doc.id)
+            .where(
+                Doc.dataset == dataset,
+                or_(
+                    Query.llm.is_(None),
+                    Query.origin.in_(settings.eval_whitelist_origins),
+                ),
+                QueryVector.emb_model == emb_model,
+                Query.origin == "dataset",
+            )
+            .limit(max_queries)
+            .order_by(Query.id)
+        )
+        results = await session.execute(query_sql)
+        rows = results.all()
+        if not rows:
+            raise ValueError(
+                f"No dataset-origin queries found for dataset {dataset} with emb model {emb_model}."
+            )
+
+        queries_data: List[EvaluationQueryData] = []
+        embeddings_data: List[EvaluationEmbeddingData] = []
+        for row in rows:
+            qd = EvaluationQueryData(**row._asdict())
+            queries_data.append(qd)
+            embeddings_data.append(EvaluationEmbeddingData(vector=row.vector))
+
+        logger.info(
+            f"Ready to evaluate {len(queries_data)} dataset-origin queries (two-stage)"
+        )
+
+        # Prepare two-stage pipeline: query-based (origin="two-stage") + chunk-based
+        logger.info(
+            "Preparing two-stage pipeline (query-origin='two-stage' + chunk-based retrieval)"
+        )
+        pipeline = TwoStageRAGPipeline(
+            k_query=k_query,
+            k_chunk=k_chunk,
+            emb_model=emb_model,
+            dataset=dataset,
+            rag_llm=rag_llm,
+            qgen_llm=qgen_llm,
+            qa_type=rag_qa_type,
+            deduplication_factor=deduplication_factor,
+            retrieval_query_origins_query=["two-stage"],
+        )
+        await pipeline.fit(session)
+        logger.info("Two-stage pipeline fitted")
+
+        # Load triplets for the queries used in the query-based retriever
+        triplet_map: dict[int, GroundTruthItem] = {}
+        if settings.rag_triplet_json_path:
+            triplet_map = load_triplets_from_json(settings.rag_triplet_json_path)
+        else:
+            eval_query_ids = [
+                item.query_id
+                for item in getattr(pipeline.query_retriever, "fit_items", [])
+                if hasattr(item, "query_id")
+            ]
+            triplet_map = await fetch_triplets_by_eval_query_ids(
+                session, eval_query_ids
+            )
+
+        triplet_eval_index = triplet_map
+        logger.info(
+            f"Triplets ready for two-stage eval: {len(triplet_eval_index)} eval queries"
+        )
+
+        # Evaluation bookkeeping
+        results_dirname = (
+            f"{datetime_str}_two_stage_triplet_"
+            f"{dataset}_"
+            f"{emb_model.split('/')[-1]}_"
+            f"{rag_llm.split('/')[-1]}_"
+            f"{qgen_llm.split('/')[-1]}"
+        )
+
+        evaluation_set = EvaluationSet(
+            dataset=dataset,
+            datetime=dt.now(),
+            metrics=None,
+            settings=dict(
+                results_dirname=results_dirname, **settings.model_dump(mode="json")
+            ),
+        )
+        session.add(evaluation_set)
+        await session.flush()
+        await session.refresh(evaluation_set)
+        evaluation_set_id = evaluation_set.id
+
+        all_rag_responses: List[RagResponse] = []
+        ground_truths: List[List[GroundTruthItem]] = []
+
+        # Pre-fetch chunks and answers maps (same as run_triplet_evaluation)
+        query_ids = [q.id for q in queries_data]
+        chunk_ids_present = [q.chunk_id for q in queries_data if q.chunk_id]
+
+        chunk_texts_map: dict[int, str] = {}
+        if chunk_ids_present:
+            in_clause_batch_size = 10000
+            for start_index in range(0, len(chunk_ids_present), in_clause_batch_size):
+                batch_chunk_ids = chunk_ids_present[
+                    start_index : start_index + in_clause_batch_size
+                ]
+                batch_chunks_result = await session.execute(
+                    select(Chunk.id, Chunk.text).where(Chunk.id.in_(batch_chunk_ids))
+                )
+                for row in batch_chunks_result.all():
+                    chunk_texts_map[row.id] = row.text
+
+        answer_texts_map: dict[int, str] = {}
+        if query_ids:
+            in_clause_batch_size = 10000
+            for start_index in range(0, len(query_ids), in_clause_batch_size):
+                batch_query_ids = query_ids[
+                    start_index : start_index + in_clause_batch_size
+                ]
+                batch_answers_result = await session.execute(
+                    select(Answer.id, Answer.query_id, Answer.text).where(
+                        Answer.query_id.in_(batch_query_ids)
+                    )
+                )
+                for row in batch_answers_result.all():
+                    answer_texts_map[row.query_id] = row.text
+
+        # Run in batches
+        tasks = []
+        for i in tqdm(range(0, len(queries_data), batch_size)):
+            batch_q = queries_data[i : i + batch_size]
+            batch_emb = embeddings_data[i : i + batch_size]
+            questions = [str(q.text) for q in batch_q]
+            emb = np.array([e.vector for e in batch_emb])
+            if np.isnan(emb).any():
+                logger.warning(f"Found null embeddings in batch {i // batch_size + 1}")
+                emb = None
+
+            # Retrieve for both stages with max k
+            if emb is not None and not np.isnan(emb).any():
+                query_retrieval_results, chunk_retrieval_results = pipeline.retrieve(
+                    emb
+                )
+            else:
+                embeddings = await pipeline.embed_queries(questions)
+                query_retrieval_results, chunk_retrieval_results = pipeline.retrieve(
+                    embeddings
+                )
+
+            for idx, (query, query_retres, chunk_retres) in enumerate(
+                zip(batch_q, query_retrieval_results, chunk_retrieval_results)
+            ):
+                # Build ground truth entry for this query (single-k; reused across ks)
+                chunk_ids = [query.chunk_id] if query.chunk_id else []
+                chunk_texts = (
+                    [chunk_texts_map.get(query.chunk_id, "")]
+                    if query.chunk_id
+                    else [""]
+                )
+                ground_truths.append(
+                    [
+                        GroundTruthItem(
+                            doc_ids=[int(query.doc_id)],
+                            doc_titles=[str(getattr(query, "doc_title", ""))],
+                            chunk_ids=chunk_ids,
+                            chunk_texts=chunk_texts,
+                            query=str(query.text),
+                            answer=answer_texts_map.get(query.id),
+                        )
+                    ]
+                )
+
+                # Match triplets using the query-based retrieval (origin="two-stage")
+                matched_triplets = find_triplets_for_retrieval_by_eval_query(
+                    triplet_eval_index,
+                    query_retres,
+                    allowed_origins=["two-stage"],
+                )
+
+                # Deduplicate and keep only found triplets
+                triplets = [t for t in matched_triplets if t is not None]
+                logger.info(f"Found {len(triplets)} triplets for query {query.id}")
+
+                # For each k, build combined context (triplets first, then chunks)
+                for k in ks:
+                    # Use metadata from chunk retrieval when available for dataset/emb_model
+                    effective_dataset = (
+                        chunk_retres.items[0].metadata.dataset
+                        if chunk_retres.items
+                        else dataset
+                    )
+                    effective_emb_model = (
+                        chunk_retres.items[0].metadata.emb_model
+                        if chunk_retres.items
+                        else emb_model
+                    )
+
+                    tasks.append(
+                        pipeline.generator.generate_triplets_with_chunks(
+                            question=str(query.text),
+                            triplets=triplets,
+                            chunk_retrieval_result=chunk_retres,
+                            k=k,
+                            dataset=effective_dataset,
+                            emb_model=effective_emb_model,
+                            generate_answer=generate_answer,
+                        )
+                    )
+
+        responses = await execute_with_semaphore(tasks)
+        all_rag_responses.extend(responses)
+
+        logger.info("Calculating metrics for each k value (two-stage)")
+
+        two_stage_ks = list(set(response.n_context for response in all_rag_responses))
+        metrics_result = calculate_metrics(
+            two_stage_ks,
+            all_rag_responses,
+            ground_truths,
+            dataset=dataset,
+            deduplication_factor=deduplication_factor,
+        )
+
+        evaluation_result = EvaluationResult(
+            rag_responses=all_rag_responses,
+            ground_truth=ground_truths,
+            metrics=metrics_result.metrics,
+            experiment_name=results_dirname,
+            eval_llm=settings.eval_llm,
+            eval_embedding_model=settings.eval_embedding_model,
+        )
+
+        evaluation_set.set_metrics(evaluation_result.model_dump(include={"metrics"}))
+        await session.commit()
+
+    logger.info("Saving two-stage triplet evaluation results")
+    dirpath = settings.path_eval / results_dirname
+    dirpath.mkdir(parents=True, exist_ok=True)
+
+    if write_spreadsheet:
+        from ..config.spreadsheets import write_evaluation_to_spreadsheet
+
+        try:
+            write_evaluation_to_spreadsheet(
+                evaluation_result=evaluation_result,
+                experiment_name=results_dirname,
+                sheet_name=spreadsheet_sheet_name,
+                retrieval_sources="query+chunk-two-stage",
+            )
+            logger.info(
+                "Successfully wrote two-stage evaluation results to spreadsheet"
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to write two-stage results to spreadsheet: {str(e)}",
+                exc_info=True,
+            )
+
+    if write_json:
+        with open(dirpath / f"{datetime_str}.json", "w", encoding="utf-8") as f:
+            json.dump(evaluation_result.model_dump(), f, indent=2, ensure_ascii=False)
+
+    if write_txt:
+        with open(dirpath / f"{datetime_str}.txt", "w", encoding="utf-8") as f:
+            f.write(evaluation_result.format_str())
+
+    df_metrics = pd.DataFrame(
+        [m.model_dump(exclude_none=True) for m in evaluation_result.metrics]
+    )
+    df_metrics.to_csv(dirpath / f"{datetime_str}_metrics.csv", index=False)
+    logger.info(
+        f"Two-stage triplet evaluation results saved to {dirpath.relative_to(settings.path_root)}"
+    )
 
     return evaluation_result

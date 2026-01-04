@@ -280,8 +280,9 @@ def update_spreadsheet_with_ragas_metrics(
 ) -> None:
     """Update existing spreadsheet rows with ragas metrics.
 
-    This function finds existing rows by experiment_name and updates them with ragas metrics,
-    rather than creating new rows.
+    This function finds existing rows by experiment_name and updates them with ragas metrics.
+    If no existing rows are found, it appends new row(s) for the experiment and writes the
+    available metrics into the new rows (aligned to the sheet header).
 
     Args:
         evaluation_result: EvaluationResult object with ragas metrics
@@ -325,11 +326,40 @@ def update_spreadsheet_with_ragas_metrics(
     # Find header row and experiment rows
     headers = all_values[0]
 
-    # Find the experiment_name column
-    try:
-        exp_name_col_idx = headers.index("Experiment")
-    except ValueError:
-        raise ValueError("experiment_name column not found in spreadsheet")
+    def _norm_header(s: str) -> str:
+        return "".join(ch.lower() for ch in str(s).strip() if ch.isalnum() or ch == "_")
+
+    def _find_col_idx(headers_: List[str], candidates: List[str]) -> Optional[int]:
+        # Exact match first
+        for c in candidates:
+            try:
+                return headers_.index(c)
+            except ValueError:
+                continue
+        # Normalized match
+        norm_to_idx = {_norm_header(h): i for i, h in enumerate(headers_)}
+        for c in candidates:
+            if (idx := norm_to_idx.get(_norm_header(c))) is not None:
+                return idx
+        return None
+
+    # Find the experiment_name column (support common header variants)
+    exp_name_col_idx = _find_col_idx(
+        headers,
+        [
+            "Experiment",
+            "experiment",
+            "experiment_name",
+            "Experiment name",
+            "Folder",
+            "folder",
+        ],
+    )
+    if exp_name_col_idx is None:
+        raise ValueError(
+            "experiment_name column not found in spreadsheet (expected one of: "
+            "Experiment/experiment_name/Folder)"
+        )
 
     # Find all rows that match the experiment name
     matching_row_indices = []
@@ -337,20 +367,60 @@ def update_spreadsheet_with_ragas_metrics(
         if len(row) > exp_name_col_idx and row[exp_name_col_idx] == experiment_name:
             matching_row_indices.append(i)
 
-    if not matching_row_indices:
-        logger.warning(f"No existing rows found for experiment: {experiment_name}")
-        logger.info("Consider running the main evaluation first, then ragas evaluation")
-        return
-
-    logger.info(
-        f"Found {len(matching_row_indices)} rows to update for experiment: {experiment_name}"
-    )
-
     # Create DataFrame with ragas metrics for each k value
     df_ragas = evaluation_result_to_dataframe(
         evaluation_result=evaluation_result,
         experiment_name=experiment_name,
         retrieval_sources=retrieval_sources,
+    )
+
+    if df_ragas.empty:
+        logger.warning("No metrics available to write to spreadsheet")
+        return
+
+    if not matching_row_indices:
+        # No existing experiment rows: append new rows aligned to header.
+        logger.warning(f"No existing rows found for experiment: {experiment_name}")
+        logger.info(
+            "Appending new rows for this experiment (folder) instead of updating"
+        )
+
+        # Build a mapping from sheet headers -> dataframe columns
+        df_cols = list(df_ragas.columns)
+        norm_df_cols = {_norm_header(c): c for c in df_cols}
+        header_aliases = {
+            "experiment": "experiment_name",
+            "experimentname": "experiment_name",
+            "folder": "experiment_name",
+        }
+
+        rows_to_append: List[List[object]] = []
+        for _, r in df_ragas.iterrows():
+            row_values: List[object] = []
+            for h in headers:
+                h_norm = _norm_header(h)
+                df_col = norm_df_cols.get(h_norm) or norm_df_cols.get(
+                    _norm_header(header_aliases.get(h_norm, ""))
+                )
+                if df_col and df_col in r and pd.notna(r[df_col]):
+                    row_values.append(r[df_col])
+                else:
+                    row_values.append("")
+            rows_to_append.append(row_values)
+
+        start_row = len(all_values) + 1
+        end_col_letter = _number_to_column_letter(len(headers))
+        range_to_write = (
+            f"A{start_row}:{end_col_letter}{start_row + len(rows_to_append) - 1}"
+        )
+        worksheet.update(range_to_write, rows_to_append)
+        logger.info(
+            f"Successfully appended {len(rows_to_append)} row(s) for experiment: {experiment_name}"
+        )
+        return
+
+    logger.info(
+        f"Found {len(matching_row_indices)} rows to update for experiment: {experiment_name}"
     )
 
     # Map ragas metrics by k value for easy lookup

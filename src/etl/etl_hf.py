@@ -260,11 +260,13 @@ async def etl_kilt_nq_to_sql(
     kilt_json_path = None
 
     # Build possible paths based on configuration
-    hf_home = Path(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")))
+    hf_home = Path(
+        os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    )
     file_rel = "downloads/kilt_knowledgesource.json"
     possible_paths = [
-        hf_home / "datasets" / file_rel, # HF_HOME environment variable
-        settings.path_data_datasets / file_rel, # Custom cache dir from settings
+        hf_home / "datasets" / file_rel,  # HF_HOME environment variable
+        settings.path_data_datasets / file_rel,  # Custom cache dir from settings
     ]
 
     for path in possible_paths:
@@ -293,24 +295,32 @@ async def etl_kilt_nq_to_sql(
         for line in f:
             processed += 1
             if processed % 100000 == 0:
-                logger.info(f"Processed {processed:,} articles, found {len(wiki_data)}/{len(needed_ids)}")
+                logger.info(
+                    f"Processed {processed:,} articles, found {len(wiki_data)}/{len(needed_ids)}"
+                )
 
             article = json.loads(line)
             wiki_id = str(article.get("wikipedia_id", ""))
 
             if wiki_id in needed_ids:
-                wiki_data.append({
-                    "wikipedia_id": wiki_id,
-                    "wikipedia_title": article.get("wikipedia_title", ""),
-                    "paragraphs": article.get("text", []),
-                })
+                wiki_data.append(
+                    {
+                        "wikipedia_id": wiki_id,
+                        "wikipedia_title": article.get("wikipedia_title", ""),
+                        "paragraphs": article.get("text", []),
+                    }
+                )
 
                 # Early exit if we found everything
                 if len(wiki_data) >= len(needed_ids):
-                    logger.info(f"Found all {len(needed_ids)} articles after {processed:,} lines")
+                    logger.info(
+                        f"Found all {len(needed_ids)} articles after {processed:,} lines"
+                    )
                     break
 
-    logger.info(f"Loaded {len(wiki_data)}/{len(needed_ids)} Wikipedia articles from JSON")
+    logger.info(
+        f"Loaded {len(wiki_data)}/{len(needed_ids)} Wikipedia articles from JSON"
+    )
     df_wiki = pd.DataFrame(wiki_data)
 
     # Merge question-level info with wiki paragraphs

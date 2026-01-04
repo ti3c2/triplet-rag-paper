@@ -142,17 +142,24 @@ def find_triplet_for_retrieval_by_chunks(
 def find_triplets_for_retrieval_by_eval_query(
     triplet_eval_map: dict[int, Triplet],
     retrieval_result: RetrievalResult,
+    allowed_origins: List[str] | None = None,
 ) -> List[Triplet | None]:
-    """Match triplet using eval-origin query ids present in retrieval result."""
+    """Match triplet using query ids present in retrieval result.
+
+    By default this matches queries whose ``origin`` field is in
+    ``allowed_origins`` (if provided). Existing callers can pass
+    ``allowed_origins=[\"eval\"]`` to keep the original behavior.
+    """
     logger.debug(retrieval_result.model_dump_json(indent=2))
-    out = []
+    out: List[Triplet | None] = []
     for item in retrieval_result.items:
         meta = item.metadata
+        origin = getattr(meta, "origin", None)
         if (
             meta.type == "query"
             and isinstance(meta.query_id, int)
-            and getattr(meta, "origin", None) == "eval"
             and meta.query_id in triplet_eval_map
+            and (allowed_origins is None or origin in allowed_origins)
         ):
             out.append(triplet_eval_map[meta.query_id])
         else:

@@ -116,6 +116,7 @@ def rag_response_to_ragas_sample(
     rag_response: RagResponse,
     ground_truth: GroundTruthItem,
     k: int,
+    ignore_retrieval_sources: List[str] = settings.ragas_ignore_retrieval_sources,
 ) -> Optional[SingleTurnSample]:
     """Convert RagResponse and GroundTruthItem to ragas SingleTurnSample format."""
     # Validate required fields
@@ -135,16 +136,13 @@ def rag_response_to_ragas_sample(
     contexts = []
     for item in retrieval_items:
         metadata = item.metadata
-        if metadata.type == "chunk":
+        if metadata.type == "chunk" and metadata.type not in ignore_retrieval_sources:
             contexts.append(item.text)
-        elif metadata.type == "query":
+        elif metadata.type == "query" and metadata.type not in ignore_retrieval_sources:
             query = metadata.query.split(settings.qa_separator)[0]
             gt_answer = ground_truth.answer.strip() if ground_truth.answer else None
             if settings.rag_add_chunk_to_query:
-                context = (
-                    f"C: {metadata.chunk_text}\n"
-                    f"Q: {query}"
-                )
+                context = f"C: {metadata.chunk_text}\n" f"Q: {query}"
             else:
                 context = f"Q: {query}"
 

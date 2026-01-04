@@ -98,8 +98,10 @@ class ProjectSettings(
     rag_generation_max_tokens: int = 1000
     rag_batch_size: int = 50
     rag_readonly_eval: bool = True
+
     # Triplet/augmentation flags
     rag_use_triplet_contexts: bool = False
+    rag_triplet_apply_formatting: str = "triplet"  # chunk, qa, triplet
     rag_max_triplet_contexts: int = -1
     rag_persist_triplets: bool = False
     rag_triplet_json_path: Optional[str] = None
@@ -157,6 +159,7 @@ class ProjectSettings(
     ragas_batch_size: Optional[int] = None
     ragas_max_retries: int = 3
     ragas_timeout: float = 30.0
+    ragas_ignore_retrieval_sources: List[str] = []
 
     # Logging
     log_level: int = logging.INFO

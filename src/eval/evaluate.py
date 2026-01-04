@@ -6,7 +6,7 @@ from typing import List, Literal, Optional
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import and_, or_, select, func
+from sqlalchemy import and_, func, or_, select
 from tqdm import tqdm
 
 from ..config.settings import settings
@@ -296,7 +296,7 @@ async def run_evaluation(
     triplets_for_json: list[Triplet] = []
 
     async with get_db() as session:
-        results = await session.execute(
+        query_q_sql = (
             select(
                 Query.id,
                 Query.text,
@@ -324,6 +324,10 @@ async def run_evaluation(
                         "eval" in origins,
                         Query.llm == settings.question_generation_model,
                     ),
+                    and_(
+                        "eval" in origins,
+                        Query.llm.is_(None),
+                    ),
                     "eval" not in origins,
                 ),
                 # Query.qa_type == "q",
@@ -332,6 +336,10 @@ async def run_evaluation(
             # .distinct(Query.text_hash) # Use all the queries even if there are duplicates
             .limit(max_queries)
         )
+        logger.info(
+            f"Query SQL:\n{query_q_sql.compile(compile_kwargs={'literal_binds': True})}"
+        )
+        results = await session.execute(query_q_sql)
         results = results.all()
 
         if not results:
